@@ -29,6 +29,7 @@ import (
 	"github.com/knadh/listmonk/models"
 	"github.com/knadh/paginator"
 	"github.com/knadh/stuffbin"
+	"github.com/pocketbase/pocketbase"
 )
 
 // App contains the "global" shared components, controllers and fields.
@@ -52,6 +53,7 @@ type App struct {
 	events     *events.Events
 	log        *log.Logger
 	bufLog     *buflog.BufLog
+	pb         *pocketbase.PocketBase
 
 	about         about
 	fnOptinNotify func(models.Subscriber, []int) (int, error)
@@ -81,6 +83,7 @@ var (
 	fs      stuffbin.FileSystem
 	db      *sqlx.DB
 	queries *models.Queries
+	pb      *pocketbase.PocketBase
 
 	// Compile-time variables.
 	buildString   string
@@ -137,6 +140,7 @@ func init() {
 
 	// Connect to the database.
 	db = initDB()
+	pb = initPocketBase()
 
 	// Initialize the embedded filesystem with static assets.
 	fs = initFS(appDir, frontendDir, ko.String("static-dir"), ko.String("i18n-dir"))
@@ -320,6 +324,9 @@ func main() {
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 		defer cancel()
 		srv.Shutdown(ctx)
+		if app.pb != nil {
+			_ = app.pb.ResetBootstrapState()
+		}
 
 		// Close the campaign manager.
 		mgr.Close()

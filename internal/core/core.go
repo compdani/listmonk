@@ -6,6 +6,7 @@ package core
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/jmoiron/sqlx"
+	"github.com/jmoiron/sqlx/types"
 	"github.com/knadh/listmonk/internal/i18n"
 	"github.com/knadh/listmonk/models"
 	"github.com/labstack/echo/v4"
@@ -37,6 +39,10 @@ type Core struct {
 	db     *sqlx.DB
 	q      *models.Queries
 	log    *log.Logger
+
+	getSettings      func() (types.JSONText, error)
+	setSettings      func(types.JSONText) error
+	setSettingsByKey func(string, json.RawMessage) error
 }
 
 // Constants represents constant config.
@@ -61,6 +67,10 @@ type Opt struct {
 	DB        *sqlx.DB
 	Queries   *models.Queries
 	Log       *log.Logger
+
+	GetSettings      func() (types.JSONText, error)
+	SetSettings      func(types.JSONText) error
+	SetSettingsByKey func(string, json.RawMessage) error
 }
 
 var (
@@ -84,6 +94,10 @@ func New(o *Opt, h *Hooks) *Core {
 		db:     o.DB,
 		q:      o.Queries,
 		log:    o.Log,
+
+		getSettings:      o.GetSettings,
+		setSettings:      o.SetSettings,
+		setSettingsByKey: o.SetSettingsByKey,
 	}
 }
 
