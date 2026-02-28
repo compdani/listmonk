@@ -2,15 +2,14 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
-	"io"
 	"log"
-	"log/slog"
 	"maps"
 	"net/http"
 	"os"
@@ -22,7 +21,6 @@ import (
 	"time"
 
 	"github.com/Masterminds/sprig/v3"
-	"github.com/gdgvda/cron"
 	"github.com/jmoiron/sqlx"
 	"github.com/jmoiron/sqlx/types"
 	"github.com/knadh/goyesql/v2"
@@ -51,6 +49,11 @@ import (
 	"github.com/knadh/stuffbin"
 	"github.com/labstack/echo/v4"
 	"github.com/lib/pq"
+	"github.com/pocketbase/dbx"
+	"github.com/pocketbase/pocketbase"
+	"github.com/pocketbase/pocketbase/apis"
+	pbcore "github.com/pocketbase/pocketbase/core"
+	"github.com/pocketbase/pocketbase/tools/cron"
 	flag "github.com/spf13/pflag"
 	"gopkg.in/volatiletech/null.v6"
 )
@@ -403,7 +406,30 @@ func prepareQueries(qMap goyesql.Queries, db *sqlx.DB, ko *koanf.Koanf) *models.
 // initSettings loads settings from the DB into the given Koanf map.
 func initSettings(query string, db *sqlx.DB, ko *koanf.Koanf) {
 	var s types.JSONText
-	if err := db.Get(&s, query); err != nil {
+
+	if pb != nil {
+		if out, ok, err := getPBSettings(pb); err != nil {
+			lo.Fatalf("error reading settings from PocketBase: %v", err)
+		} else if ok {
+			s = out
+		} else {
+			// Fallback to existing SQL source for first run and seed PocketBase persistence.
+			if err := db.Get(&s, query); err != nil {
+				msg := err.Error()
+				if err, ok := err.(*pq.Error); ok {
+					if err.Detail != "" {
+						msg = fmt.Sprintf("%s. %s", err, err.Detail)
+					}
+				}
+
+				lo.Fatalf("error reading settings from DB: %s", msg)
+			}
+
+			if err := setPBSettings(pb, s); err != nil {
+				lo.Fatalf("error seeding PocketBase settings from SQL: %v", err)
+			}
+		}
+	} else if err := db.Get(&s, query); err != nil {
 		msg := err.Error()
 		if err, ok := err.(*pq.Error); ok {
 			if err.Detail != "" {
@@ -423,6 +449,82 @@ func initSettings(query string, db *sqlx.DB, ko *koanf.Koanf) {
 	if err := ko.Load(confmap.Provider(out, "."), nil); err != nil {
 		lo.Fatalf("error parsing settings from DB: %v", err)
 	}
+}
+
+func initPocketBase() *pocketbase.PocketBase {
+	pb := pocketbase.NewWithConfig(pocketbase.Config{
+		HideStartBanner: true,
+		DefaultDataDir:  "pb_data",
+	})
+
+	if err := pb.Bootstrap(); err != nil {
+		lo.Fatalf("error bootstrapping pocketbase: %v", err)
+	}
+
+	if _, err := pb.DB().NewQuery(`
+CREATE TABLE IF NOT EXISTS listmonk_settings (
+	id INTEGER PRIMARY KEY,
+	value TEXT NOT NULL,
+	updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+)`).Execute(); err != nil {
+		lo.Fatalf("error initializing pocketbase settings table: %v", err)
+	}
+
+	return pb
+}
+
+func getPBSettings(pb *pocketbase.PocketBase) (types.JSONText, bool, error) {
+	var row struct {
+		Value []byte `db:"value"`
+	}
+
+	err := pb.DB().NewQuery("SELECT value FROM listmonk_settings WHERE id = 1").One(&row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+
+	return row.Value, true, nil
+}
+
+func setPBSettings(pb *pocketbase.PocketBase, value []byte) error {
+	_, err := pb.DB().Upsert("listmonk_settings", dbx.Params{
+		"id":         1,
+		"value":      string(value),
+		"updated_at": time.Now().UTC().Format(time.RFC3339),
+	}, "id").Execute()
+
+	return err
+}
+
+func patchPBSettings(pb *pocketbase.PocketBase, key string, value json.RawMessage) error {
+	raw, ok, err := getPBSettings(pb)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		raw = []byte("{}")
+	}
+
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return err
+	}
+
+	var out any
+	if err := json.Unmarshal(value, &out); err != nil {
+		return err
+	}
+	m[key] = out
+
+	b, err := json.Marshal(m)
+	if err != nil {
+		return err
+	}
+
+	return setPBSettings(pb, b)
 }
 
 func initUrlConfig(ko *koanf.Koanf) *UrlConfig {
@@ -542,6 +644,19 @@ func initCore(fnNotify func(sub models.Subscriber, listIDs []int) (int, error), 
 		DB:      db,
 		I18n:    i,
 		Log:     lo,
+	}
+
+	if pb != nil {
+		opt.GetSettings = func() (types.JSONText, error) {
+			v, _, err := getPBSettings(pb)
+			return v, err
+		}
+		opt.SetSettings = func(v types.JSONText) error {
+			return setPBSettings(pb, v)
+		}
+		opt.SetSettingsByKey = func(key string, value json.RawMessage) error {
+			return patchPBSettings(pb, key, value)
+		}
 	}
 
 	// Load bounce config.
@@ -930,16 +1045,24 @@ func initHTTPServer(cfg *Config, urlCfg *UrlConfig, i *i18n.I18n, fs stuffbin.Fi
 	// Register all HTTP handlers.
 	initHTTPHandlers(srv, app)
 
-	// Start the server.
+	// Start listmonk with PocketBase as the routing server and proxy all listmonk
+	// routes through PocketBase's router.
+	pb.OnServe().BindFunc(func(e *pbcore.ServeEvent) error {
+		e.Router.Any("/{path...}", apis.WrapStdHandler(srv))
+		return e.Next()
+	})
+
 	go func() {
-		if err := srv.Start(ko.String("app.address")); err != nil {
-			if errors.Is(err, http.ErrServerClosed) {
+		if err := apis.Serve(pb, apis.ServeConfig{HttpAddr: ko.String("app.address")}); err != nil {
+			if errors.Is(err, http.ErrServerClosed) || errors.Is(err, context.Canceled) {
 				lo.Println("HTTP server shut down")
 			} else {
-				lo.Fatalf("error starting HTTP server: %v", err)
+				lo.Fatalf("error starting pocketbase HTTP server: %v", err)
 			}
 		}
 	}()
+
+	app.pb = pb
 
 	return srv
 }
@@ -956,7 +1079,7 @@ func initCaptcha() *captcha.Captcha {
 
 // initCron initializes cron jobs for slow query cache refresh and database vacuum.
 func initCron(co *core.Core, db *sqlx.DB) {
-	c := cron.New(cron.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
+	c := cron.New()
 
 	// Slow query cache cron job.
 	if ko.Bool("app.cache_slow_queries") {
@@ -964,7 +1087,7 @@ func initCron(co *core.Core, db *sqlx.DB) {
 		if intval == "" {
 			lo.Println("error: invalid cron interval string for slow query cache")
 		} else {
-			_, err := c.Add(intval, func() {
+			err := c.Add("slow-query-cache-refresh", intval, func() {
 				lo.Println("refreshing slow query cache")
 				_ = co.RefreshMatViews(true)
 				lo.Println("done refreshing slow query cache")
@@ -972,7 +1095,7 @@ func initCron(co *core.Core, db *sqlx.DB) {
 			if err != nil {
 				lo.Printf("error initializing slow cache query cron: %v", err)
 			} else {
-				lo.Printf("IMPORTANT: database slow query caching is enabled. Aggregate numbers and stats will not be realtime. Next refresh at: %v", c.Entries()[len(c.Entries())-1].Next)
+				lo.Printf("IMPORTANT: database slow query caching is enabled. Aggregate numbers and stats will not be realtime. Interval: %s", intval)
 			}
 		}
 	}
@@ -983,7 +1106,7 @@ func initCron(co *core.Core, db *sqlx.DB) {
 		if intval == "" {
 			lo.Println("error: invalid cron interval string for database vacuum")
 		} else {
-			_, err := c.Add(intval, func() {
+			err := c.Add("database-vacuum", intval, func() {
 				RunDBVacuum(db, lo)
 			})
 			if err != nil {
@@ -994,7 +1117,7 @@ func initCron(co *core.Core, db *sqlx.DB) {
 		}
 	}
 
-	if len(c.Entries()) > 0 {
+	if c.Total() > 0 {
 		c.Start()
 	}
 }

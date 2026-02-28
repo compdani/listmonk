@@ -13,7 +13,6 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/gdgvda/cron"
 	"github.com/gofrs/uuid/v5"
 	"github.com/jmoiron/sqlx/types"
 	koanfjson "github.com/knadh/koanf/parsers/json"
@@ -24,6 +23,7 @@ import (
 	"github.com/knadh/listmonk/internal/notifs"
 	"github.com/knadh/listmonk/models"
 	"github.com/labstack/echo/v4"
+	"github.com/pocketbase/pocketbase/tools/cron"
 )
 
 const pwdMask = "•"
@@ -281,7 +281,7 @@ func (a *App) UpdateSettings(c echo.Context) error {
 
 	// Validate slow query caching cron.
 	if set.CacheSlowQueries {
-		if _, err := cron.ParseStandard(set.CacheSlowQueriesInterval); err != nil {
+		if _, err := cron.NewSchedule(set.CacheSlowQueriesInterval); err != nil {
 			return echo.NewHTTPError(http.StatusBadRequest, a.i18n.Ts("globals.messages.invalidData")+": slow query cron: "+err.Error())
 		}
 	}
